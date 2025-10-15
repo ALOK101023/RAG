@@ -116,4 +116,4 @@ with gr.Blocks() as iface:
     )
 
 # This starts the app
-iface.launch()
+iface.launch(server_name="0.0.0.0")
