@@ -1,119 +1,132 @@
-# app.py
-
+# Final check to force redeployment
 import gradio as gr
 import os
-from langchain_openai import OpenAIEmbeddings, ChatOpenAI
-from langchain_community.vectorstores import FAISS
+from langchain_community.document_loaders import YoutubeLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_core.runnables import RunnablePassthrough
-from langchain_core.output_parsers import StrOutputParser
-from langchain_core.prompts import ChatPromptTemplate
-from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled
+from langchain_openai import OpenAIEmbeddings, OpenAI
+from langchain.vectorstores import FAISS
+from langchain.chains import LLMChain
+from langchain.prompts import PromptTemplate
+from youtube_transcript_api import YouTubeTranscriptApi
 
-# --- Part 1: Setup ---
-# This part runs only once when the Space starts up.
-try:
-    # Securely load the API key from Space secrets
-    embeddings = OpenAIEmbeddings(openai_api_key=os.environ.get("OPENAI_API_KEY"))
-    llm = ChatOpenAI(openai_api_key=os.environ.get("OPENAI_API_KEY"), model="gpt-4o-mini", temperature=0.2)
+# It's better practice to get the API key from the environment variables set in Render
+# rather than hardcoding it or using a .env file on the server.
+api_key = os.environ.get("OPENAI_API_KEY")
 
-    # The prompt template for the RAG chain
-    prompt = ChatPromptTemplate.from_template(
-        """You are a helpful assistant. Answer ONLY from the provided transcript context.
-        If the context is insufficient, just say you don't know.
+if not api_key:
+    # This will show an error on the Gradio interface if the API key is not set.
+    raise ValueError("OPENAI_API_KEY environment variable not set!")
 
-        Context: {context}
-        Question: {question}
-        """
-    )
-    app_ready = True
-except Exception as e:
-    app_ready = False
-    app_init_error = e
+embeddings = OpenAIEmbeddings(openai_api_key=api_key)
+video_db = None
 
-# This global variable will hold our RAG chain after a video is loaded
-rag_chain = None
-
-# --- Part 2: Core Logic Functions ---
-
-# This function loads a video, creates a vector store, and builds the RAG chain
-def load_youtube_video(youtube_url: str) -> str:
-    global rag_chain
-    if not app_ready:
-        return f"Application failed to initialize. Error: {app_init_error}"
+def load_video(url):
+    """
+    Loads a YouTube video transcript, splits it into chunks,
+    and creates a FAISS vector database.
+    """
+    global video_db
     try:
-        # Extract video ID from URL
-        if "watch?v=" in youtube_url:
-            video_id = youtube_url.split("watch?v=")[1].split("&")[0]
-        else:
-            return "Error: Invalid YouTube URL format. Please use a full 'watch?v=' URL."
+        # Check if the URL is valid by trying to get the transcript list
+        video_id = url.split("v=")[1].split("&")[0]
+        YouTubeTranscriptApi.list_transcripts(video_id) # This is the line that was failing
 
-        # This is the most robust method for getting the transcript
-        transcript_object = YouTubeTranscriptApi.list_transcripts(video_id).find_transcript(['en'])
-        transcript_chunks = transcript_object.fetch()
-        transcript = " ".join(chunk["text"] for chunk in transcript_chunks)
-        
-        if not transcript:
-             return "Error: Could not fetch transcript content."
+        loader = YoutubeLoader.from_youtube_url(url, add_video_info=True)
+        transcript = loader.load()
 
-        # Split transcript into chunks
-        splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
-        chunks = splitter.create_documents([transcript])
+        text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=100)
+        docs = text_splitter.split_documents(transcript)
 
-        # Create a FAISS vector store from the transcript chunks
-        vector_store = FAISS.from_documents(chunks, embeddings)
+        video_db = FAISS.from_documents(docs, embeddings)
 
-        # Create a retriever from the vector store
-        retriever = vector_store.as_retriever()
-
-        # Define the RAG chain that will be used to answer questions
-        rag_chain = (
-            {"context": retriever, "question": RunnablePassthrough()}
-            | prompt
-            | llm
-            | StrOutputParser()
+        return (
+            f"Video loaded successfully! Ready to answer questions.",
+            None, # Clear chatbot history
+            gr.update(interactive=True), # Enable query input
+            gr.update(interactive=True), # Enable ask button
         )
-        return f"Successfully loaded transcript for video ID: {video_id}. You can now ask questions."
-    except TranscriptsDisabled:
-        return "Error: Transcripts are disabled for this video."
+    # THIS IS THE MODIFIED ERROR MESSAGE FOR OUR TEST
     except Exception as e:
-        return f"An error occurred: {e}"
+        return "TEST FAILED. THE NEW CODE IS RUNNING BUT THE LIBRARY IS STILL BROKEN.", None, gr.update(interactive=False), gr.update(interactive=False)
 
-# This function answers a question using the globally stored RAG chain
-def answer_question(question: str, history: list) -> str:
-    if not rag_chain:
-        return "Please load a YouTube video first before asking a question."
-    try:
-        # Invoke the RAG chain with the user's question
-        response = rag_chain.invoke(question)
-        return response
-    except Exception as e:
-        return f"An error occurred while answering the question: {e}"
 
-# --- Part 3: The User Interface ---
-# We use Gradio Blocks for a custom layout
+def query_chatbot(query, history):
+    """
+    Queries the vector database with a user question and gets a response.
+    """
+    global video_db
+    if not video_db:
+        return "Please load a video first.", history
+
+    docs = video_db.similarity_search(query)
+
+    if not docs:
+        return "Could not find relevant information in the video.", history
+
+    # Get the content from the top 4 relevant documents
+    context = " ".join([doc.page_content for doc in docs[:4]])
+
+    prompt_template = """
+    You are a helpful assistant for the YouTube video.
+    Answer the question based only on the following context from the video transcript:
+    Context: {context}
+    Question: {question}
+    Answer:
+    """
+
+    prompt = PromptTemplate(template=prompt_template, input_variables=["context", "question"])
+    llm = OpenAI(temperature=0, openai_api_key=api_key)
+    chain = LLMChain(llm=llm, prompt=prompt)
+
+    response = chain.run(context=context, question=query)
+    history.append((query, response))
+    return "", history
+
+
 with gr.Blocks() as iface:
     gr.Markdown("# YouTube Video Q&A with RAG")
-    gr.Markdown("First, enter a YouTube video URL and click 'Load Video'. This will create a knowledge base from the video's transcript. Then, ask questions about the video content in the chatbot below.")
+    gr.Markdown(
+        "First, enter a YouTube video URL and click 'Load Video'. "
+        "This will create a knowledge base from the video's transcript. "
+        "Then, ask questions about the video content in the chatbot below."
+    )
 
     with gr.Row():
-        url_input = gr.Textbox(label="YouTube URL", placeholder="https://www.youtube.com/watch?v=...")
-        load_button = gr.Button("Load Video")
-    
+        youtube_url_input = gr.Textbox(
+            label="YouTube URL",
+            placeholder="https://www.youtube.com/watch?v=GfH5Of6ZBvo",
+            interactive=True,
+        )
+        load_video_btn = gr.Button("Load Video")
+
     status_output = gr.Textbox(label="Status", interactive=False)
-    
-    chatbot = gr.ChatInterface(
-        fn=answer_question,
-        title="Video Chatbot",
-        examples=[["What is DeepMind?"], ["Can you summarize the video?"]]
+
+    chatbot = gr.Chatbot(label="Video Chatbot")
+    query_input = gr.Textbox(
+        label="Ask a question", interactive=False, placeholder="What is DeepMind?"
+    )
+    ask_btn = gr.Button("Ask", interactive=False)
+
+    gr.Examples(
+        examples=[
+            "What is DeepMind?",
+            "Can you summarize the video?",
+        ],
+        inputs=query_input
     )
 
-    # Link the button click to the load_youtube_video function
-    load_button.click(
-        fn=load_youtube_video,
-        inputs=[url_input],
-        outputs=[status_output]
+    load_video_btn.click(
+        fn=load_video,
+        inputs=youtube_url_input,
+        outputs=[status_output, chatbot, query_input, ask_btn],
     )
 
-# This starts the app
+    ask_btn.click(
+        fn=query_chatbot, inputs=[query_input, chatbot], outputs=[query_input, chatbot]
+    )
+    query_input.submit(
+        fn=query_chatbot, inputs=[query_input, chatbot], outputs=[query_input, chatbot]
+    )
+
+# This line is correct for Render deployment
 iface.launch(server_name="0.0.0.0", server_port=10000)
