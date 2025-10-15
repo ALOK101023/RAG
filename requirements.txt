@@ -1,0 +1,8 @@
+gradio
+langchain
+langchain-openai
+langchain-community
+python-dotenv
+youtube-transcript-api
+faiss-cpu
+tiktoken
